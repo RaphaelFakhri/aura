@@ -450,10 +450,15 @@ async fn forward_internal_tool_completed(
         return;
     };
     let Some(tx) = event_tx else { return };
-    let success = matches!(
-        crate::tool_error_detection::detect_tool_error(result),
-        crate::tool_error_detection::ToolResultStatus::Success
-    );
+    let outcome = if crate::tool_error_detection::is_tool_error(result) {
+        aura_events::agent::ToolOutcome::Failure {
+            error: crate::tool_error_detection::tool_error_message(result).to_string(),
+        }
+    } else {
+        aura_events::agent::ToolOutcome::Success {
+            result: result.to_string(),
+        }
+    };
     let _ = tx
         .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
             &start.worker_id,
@@ -462,7 +467,7 @@ async fn forward_internal_tool_completed(
                 tool_call_id: tool_call_id.into(),
                 tool_name: start.tool_name.into(),
                 duration_ms: start.at.elapsed().as_millis() as u64,
-                outcome: outcome_of(success, result.to_string()),
+                outcome,
             },
         )))))
         .await;
