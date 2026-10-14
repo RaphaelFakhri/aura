@@ -2,6 +2,7 @@
 //! it to show people. Tool failures reach the model as result text, not as
 //! an `Err`.
 
+use crate::hitl::DENIAL_PREFIX;
 use crate::mcp::MCP_ERROR_PREFIX;
 
 /// Rig's `ToolServerError`, the text a tool's `Err` reaches the model as.
@@ -16,6 +17,7 @@ const ERROR_PREFIXES: &[&str] = &[
     "Error while sending message: ",
     "An invalid message type was returned",
     MCP_ERROR_PREFIX,
+    DENIAL_PREFIX,
     // `McpManager::execute_fallback_tool`
     "Tool execution failed: ",
     "Tool not found: ",
@@ -37,6 +39,12 @@ pub fn is_tool_error(result_text: &str) -> bool {
     ERROR_PREFIXES
         .iter()
         .any(|prefix| result_text.starts_with(prefix))
+}
+
+/// Whether `result_text` is a HITL approver's denial, a failure a person
+/// chose rather than a fault.
+pub fn is_tool_denial(result_text: &str) -> bool {
+    result_text.starts_with(DENIAL_PREFIX)
 }
 
 /// A failed call's text without the layers rig wraps around a tool's `Err`,
@@ -128,6 +136,8 @@ mod tests {
         ] {
             assert_eq!(tool_error_message(text), text);
         }
+        let denial = format!("{DENIAL_PREFIX}not today");
+        assert_eq!(tool_error_message(&denial), denial);
         assert_eq!(
             tool_error_message("Toolset error: ToolNotFoundError: missing"),
             "ToolNotFoundError: missing"
@@ -140,6 +150,15 @@ mod tests {
             tool_error_message("Toolset error: ToolCallError: "),
             "Toolset error: ToolCallError: "
         );
+    }
+
+    #[test]
+    fn only_a_denial_is_a_denial() {
+        let denial = format!("{DENIAL_PREFIX}not today");
+        assert!(is_tool_denial(&denial));
+        assert!(is_tool_error(&denial));
+        assert!(!is_tool_denial("Tool returned an error: 401 Unauthorized"));
+        assert!(!is_tool_denial("denied by policy"));
     }
 
     #[test]
