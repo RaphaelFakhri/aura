@@ -152,6 +152,15 @@ struct CoordinatorState {
     routing_decision: super::tools::routing_tools::RoutingDecision,
 }
 
+/// Which coordinator call a routing response answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingPhase {
+    /// The request's first call: the coordinator routes the query.
+    Initial,
+    /// A post-execute call: the coordinator decides what follows a plan.
+    Continuation,
+}
+
 /// Bundled coordinator tools for `build_agent_with_tools`.
 struct CoordinatorTools {
     list_tools: Option<ListToolsTool>,
@@ -1932,8 +1941,9 @@ impl Orchestrator {
     /// If the coordinator doesn't call a routing tool, appends a correction
     /// message and retries within the same conversation context.
     ///
-    /// Enforces config flags: converts Direct/Clarification to single-task
-    /// Orchestrated when `allow_direct_answers`/`allow_clarification` is false.
+    /// At initial routing (`previous` is `None`) the `allow_direct_answers`
+    /// and `allow_clarification` overrides apply to the response; see
+    /// `enforce_routing_config` for why a continuation call is exempt.
     #[tracing::instrument(
         name = "orchestration.planning",
         skip_all,
@@ -1954,13 +1964,19 @@ impl Orchestrator {
             self.build_worker_prompt_sections();
 
         // Build the primary user message based on call phase.
-        let planning_prompt = match previous {
-            None => Self::build_planning_wrapper(query, &worker_section, &worker_guidelines),
-            Some(ctx) => Self::build_continuation_wrapper(
-                ctx,
-                self.config.max_planning_cycles,
-                self.config.show_tool_reasoning_in_continuation(),
-                self.config.result_summary_length(),
+        let (routing_phase, planning_prompt) = match previous {
+            None => (
+                RoutingPhase::Initial,
+                Self::build_planning_wrapper(query, &worker_section, &worker_guidelines),
+            ),
+            Some(ctx) => (
+                RoutingPhase::Continuation,
+                Self::build_continuation_wrapper(
+                    ctx,
+                    self.config.max_planning_cycles,
+                    self.config.show_tool_reasoning_in_continuation(),
+                    self.config.result_summary_length(),
+                ),
             ),
         };
 
@@ -2095,6 +2111,7 @@ impl Orchestrator {
                 let planning_response = Self::enforce_routing_config(
                     planning_response,
                     query,
+                    routing_phase,
                     self.config.allow_direct_answers,
                     self.config.allow_clarification,
                 );
@@ -2182,17 +2199,32 @@ impl Orchestrator {
 
     /// Enforce config flags on a routing decision.
     ///
-    /// When `allow_direct_answers` or `allow_clarification` is false,
-    /// converts the response to a single-task `StepsPlan`.
+    /// Applies the `allow_direct_answers` and `allow_clarification` overrides
+    /// to an initial-routing response: a blocked `Direct` or `Clarification`
+    /// becomes a single-task `StepsPlan` so the query is orchestrated instead
+    /// of answered or questioned up front.
     ///
-    /// Takes flags as arguments (rather than reading `self.config`) so the
-    /// transformation is unit-testable without an `Orchestrator` instance.
+    /// A continuation response passes through untouched under both flags.
+    /// After a plan has executed, `Direct` is how the coordinator synthesizes
+    /// the task results into the final answer (see the `respond_directly`
+    /// tool description), so rewriting it into another plan discards that
+    /// answer and then trips the planning-cycle budget. The flags exist to
+    /// keep the coordinator from skipping orchestration, which a
+    /// post-execute decision cannot do.
+    ///
+    /// Takes the phase and flags as arguments (rather than reading
+    /// `self.config`) so the transformation is unit-testable without an
+    /// `Orchestrator` instance.
     fn enforce_routing_config(
         response: PlanningResponse,
         query: &str,
+        phase: RoutingPhase,
         allow_direct_answers: bool,
         allow_clarification: bool,
     ) -> PlanningResponse {
+        if phase == RoutingPhase::Continuation {
+            return response;
+        }
         match &response {
             PlanningResponse::Direct {
                 response: answer,
@@ -2205,7 +2237,7 @@ impl Orchestrator {
                 PlanningResponse::StepsPlan {
                     goal: query.to_string(),
                     steps: vec![super::types::StepInput::LeafTask {
-                        task: format!("Answer the user's query: {}", truncate_query(query, 80)),
+                        task: format!("Answer the user's query: {}", query),
                         worker: None,
                         artifacts: Vec::new(),
                     }],
@@ -2228,10 +2260,7 @@ impl Orchestrator {
                 PlanningResponse::StepsPlan {
                     goal: query.to_string(),
                     steps: vec![super::types::StepInput::LeafTask {
-                        task: format!(
-                            "Investigate and answer the user's query: {}",
-                            truncate_query(query, 80)
-                        ),
+                        task: format!("Investigate and answer the user's query: {}", query),
                         worker: None,
                         artifacts: Vec::new(),
                     }],
@@ -6491,7 +6520,13 @@ mod tests {
             routing_rationale: "trivial".to_string(),
             response_summary: None,
         };
-        let out = Orchestrator::enforce_routing_config(direct, "what is 6*7?", true, true);
+        let out = Orchestrator::enforce_routing_config(
+            direct,
+            "what is 6*7?",
+            RoutingPhase::Initial,
+            true,
+            true,
+        );
         assert!(matches!(out, PlanningResponse::Direct { .. }));
 
         let clar = PlanningResponse::Clarification {
@@ -6499,7 +6534,13 @@ mod tests {
             options: None,
             routing_rationale: "ambiguous".to_string(),
         };
-        let out = Orchestrator::enforce_routing_config(clar, "do the thing", true, true);
+        let out = Orchestrator::enforce_routing_config(
+            clar,
+            "do the thing",
+            RoutingPhase::Initial,
+            true,
+            true,
+        );
         assert!(matches!(out, PlanningResponse::Clarification { .. }));
     }
 
@@ -6512,7 +6553,13 @@ mod tests {
             routing_rationale: "trivial answer".to_string(),
             response_summary: None,
         };
-        let out = Orchestrator::enforce_routing_config(direct, "what is the meaning?", false, true);
+        let out = Orchestrator::enforce_routing_config(
+            direct,
+            "what is the meaning?",
+            RoutingPhase::Initial,
+            false,
+            true,
+        );
 
         match out {
             PlanningResponse::StepsPlan {
@@ -6549,7 +6596,13 @@ mod tests {
             options: Some(vec!["prod".to_string(), "stage".to_string()]),
             routing_rationale: "ambiguous env".to_string(),
         };
-        let out = Orchestrator::enforce_routing_config(clar, "check service health", true, false);
+        let out = Orchestrator::enforce_routing_config(
+            clar,
+            "check service health",
+            RoutingPhase::Initial,
+            true,
+            false,
+        );
 
         match out {
             PlanningResponse::StepsPlan {
@@ -6592,7 +6645,13 @@ mod tests {
 
         // Both flags off — should still pass through, since the response is
         // already a StepsPlan and the override only converts Direct/Clarification.
-        let out = Orchestrator::enforce_routing_config(original, "compute mean", false, false);
+        let out = Orchestrator::enforce_routing_config(
+            original,
+            "compute mean",
+            RoutingPhase::Initial,
+            false,
+            false,
+        );
         match out {
             PlanningResponse::StepsPlan {
                 goal,
@@ -6606,6 +6665,111 @@ mod tests {
             }
             _ => panic!("expected StepsPlan passthrough"),
         }
+    }
+
+    /// The fallback task is what a worker executes, so it carries the whole
+    /// query; only the rationale (a log line) is shortened.
+    #[test]
+    fn test_enforce_routing_fallback_task_carries_full_query() {
+        use super::super::types::{PlanningResponse, StepInput};
+
+        let query = "Investigate why checkout latency on the eu-west-1 cluster climbed \
+                     after the 14:05 deploy, correlate the pod restarts with the ingress \
+                     error rate, and name the first service that degraded";
+        assert!(query.len() > 80);
+
+        let direct = PlanningResponse::Direct {
+            response: "x".to_string(),
+            routing_rationale: "r".to_string(),
+            response_summary: None,
+        };
+        let out =
+            Orchestrator::enforce_routing_config(direct, query, RoutingPhase::Initial, false, true);
+        let PlanningResponse::StepsPlan { steps, .. } = out else {
+            panic!("expected StepsPlan");
+        };
+        let StepInput::LeafTask { task, .. } = &steps[0] else {
+            panic!("expected single LeafTask step");
+        };
+        assert_eq!(task, &format!("Answer the user's query: {query}"));
+
+        let clar = PlanningResponse::Clarification {
+            question: "q".to_string(),
+            options: None,
+            routing_rationale: "r".to_string(),
+        };
+        let out =
+            Orchestrator::enforce_routing_config(clar, query, RoutingPhase::Initial, true, false);
+        let PlanningResponse::StepsPlan { steps, .. } = out else {
+            panic!("expected StepsPlan");
+        };
+        let StepInput::LeafTask { task, .. } = &steps[0] else {
+            panic!("expected single LeafTask step");
+        };
+        assert_eq!(
+            task,
+            &format!("Investigate and answer the user's query: {query}")
+        );
+    }
+
+    /// A post-execute `Direct` is the coordinator's final answer; both flags
+    /// off must leave it (and a post-execute `Clarification`) untouched so
+    /// `run_iteration` reaches `FinalResult` with the coordinator's text
+    /// instead of a synthetic replan.
+    #[test]
+    fn test_enforce_routing_continuation_passes_through_when_blocked() {
+        use super::super::types::PlanningResponse;
+
+        let direct = PlanningResponse::Direct {
+            response: "Latency rose because the ingress pods restarted.".to_string(),
+            routing_rationale: "single task completed; summarizing".to_string(),
+            response_summary: Some("ingress restarts".to_string()),
+        };
+        let out = Orchestrator::enforce_routing_config(
+            direct,
+            "why did latency rise?",
+            RoutingPhase::Continuation,
+            false,
+            false,
+        );
+        let PlanningResponse::Direct {
+            response,
+            routing_rationale,
+            response_summary,
+        } = out
+        else {
+            panic!("expected Direct passthrough, got {}", out.variant_name());
+        };
+        assert_eq!(response, "Latency rose because the ingress pods restarted.");
+        assert_eq!(routing_rationale, "single task completed; summarizing");
+        assert_eq!(response_summary.as_deref(), Some("ingress restarts"));
+
+        let clar = PlanningResponse::Clarification {
+            question: "which cluster?".to_string(),
+            options: Some(vec!["eu".to_string(), "us".to_string()]),
+            routing_rationale: "two clusters matched".to_string(),
+        };
+        let out = Orchestrator::enforce_routing_config(
+            clar,
+            "why did latency rise?",
+            RoutingPhase::Continuation,
+            false,
+            false,
+        );
+        let PlanningResponse::Clarification {
+            question, options, ..
+        } = out
+        else {
+            panic!(
+                "expected Clarification passthrough, got {}",
+                out.variant_name()
+            );
+        };
+        assert_eq!(question, "which cluster?");
+        assert_eq!(
+            options.as_deref(),
+            Some(&["eu".to_string(), "us".to_string()][..])
+        );
     }
 
     #[test]
