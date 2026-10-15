@@ -2195,24 +2195,14 @@ impl Orchestrator {
         ))
     }
 
-    /// Enforce config flags on a routing decision.
+    /// Enforce config flags on an initial-routing decision: a blocked
+    /// `Direct` or `Clarification` becomes a single-task `StepsPlan`. A
+    /// continuation response passes through, since a post-execute `Direct`
+    /// is the coordinator's final answer (see `respond_directly`) and the
+    /// flags only guard against skipping orchestration.
     ///
-    /// Applies the `allow_direct_answers` and `allow_clarification` overrides
-    /// to an initial-routing response: a blocked `Direct` or `Clarification`
-    /// becomes a single-task `StepsPlan` so the query is orchestrated instead
-    /// of answered or questioned up front.
-    ///
-    /// A continuation response passes through untouched under both flags.
-    /// After a plan has executed, `Direct` is how the coordinator synthesizes
-    /// the task results into the final answer (see the `respond_directly`
-    /// tool description), so rewriting it into another plan discards that
-    /// answer and then trips the planning-cycle budget. The flags exist to
-    /// keep the coordinator from skipping orchestration, which a
-    /// post-execute decision cannot do.
-    ///
-    /// Takes the phase and flags as arguments (rather than reading
-    /// `self.config`) so the transformation is unit-testable without an
-    /// `Orchestrator` instance.
+    /// Takes the phase and flags as arguments so it is unit-testable without
+    /// an `Orchestrator`.
     fn enforce_routing_config(
         response: PlanningResponse,
         query: &str,
