@@ -1941,9 +1941,7 @@ impl Orchestrator {
     /// If the coordinator doesn't call a routing tool, appends a correction
     /// message and retries within the same conversation context.
     ///
-    /// At initial routing (`previous` is `None`) the `allow_direct_answers`
-    /// and `allow_clarification` overrides apply to the response; see
-    /// `enforce_routing_config` for why a continuation call is exempt.
+    /// The routing-flag overrides are applied by `enforce_routing_config`.
     #[tracing::instrument(
         name = "orchestration.planning",
         skip_all,
@@ -6712,10 +6710,8 @@ mod tests {
         );
     }
 
-    /// A post-execute `Direct` is the coordinator's final answer; both flags
-    /// off must leave it (and a post-execute `Clarification`) untouched so
-    /// `run_iteration` reaches `FinalResult` with the coordinator's text
-    /// instead of a synthetic replan.
+    /// Continuation responses pass through under both flags; the rule lives
+    /// on `enforce_routing_config`.
     #[test]
     fn test_enforce_routing_continuation_passes_through_when_blocked() {
         use super::super::types::PlanningResponse;
