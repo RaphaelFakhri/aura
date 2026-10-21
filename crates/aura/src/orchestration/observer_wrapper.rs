@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tool_call_observer::{ToolCallObserver, ToolEvent};
-use crate::tool_error_detection::{is_tool_error, tool_error_message};
+use crate::tool_error_detection::tool_error_message;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformArgsResult};
 
 /// Counter for generating unique tool call IDs within a process.
@@ -101,14 +101,14 @@ impl ToolWrapper for ObserverWrapper {
 
         // Emit CallCompleted event (full output — truncation happens at SSE handler layer)
         let event = match result {
-            Ok(output) if !is_tool_error(output) => ToolEvent::call_completed_success(
+            Ok(output) => ToolEvent::call_completed_success(
                 tool_call_id,
                 &ctx.tool_name,
                 &ctx.tool_initiator_id,
                 output,
                 duration_ms,
             ),
-            Ok(err) | Err(err) => ToolEvent::call_completed_error(
+            Err(err) => ToolEvent::call_completed_error(
                 tool_call_id,
                 &ctx.tool_name,
                 &ctx.tool_initiator_id,
@@ -125,6 +125,8 @@ impl ToolWrapper for ObserverWrapper {
 mod tests {
     use super::*;
     use aura_events::agent::ToolOutcome;
+    use rig::tool::ToolError;
+    use std::sync::Arc;
 
     #[test]
     fn test_generate_tool_call_id() {
@@ -269,30 +271,61 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct McpErrorTool;
+
+    impl rig::tool::Tool for McpErrorTool {
+        const NAME: &'static str = "mcp_tool";
+        type Error = ToolError;
+        type Args = Value;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+            rig::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<String, ToolError> {
+            Ok("Tool returned an error: 401 Unauthorized".to_string())
+        }
+    }
+
+    struct PrependsTag;
+
+    #[async_trait]
+    impl ToolWrapper for PrependsTag {
+        async fn transform_output(
+            &self,
+            output: String,
+            _is_error: bool,
+            _ctx: &ToolCallContext,
+            _extracted: Option<&Value>,
+        ) -> crate::tool_wrapper::TransformOutputResult {
+            crate::tool_wrapper::TransformOutputResult::new(format!("[worker-a] {output}"))
+        }
+    }
+
     #[tokio::test]
-    async fn mcp_error_results_complete_as_failures() {
+    async fn an_mcp_error_completes_as_a_failure_after_a_wrapper_prepends_to_it() {
+        use rig::tool::Tool as _;
+
         let (observer, mut rx) = ToolCallObserver::new(8);
-        let wrapper = ObserverWrapper::new(observer, 0);
+        let wrapper = crate::tool_wrapper::ComposedWrapper::new(vec![
+            Arc::new(ObserverWrapper::new(observer, 0)) as Arc<dyn ToolWrapper>,
+            Arc::new(PrependsTag),
+        ]);
+        let tool = crate::tool_wrapper::WrappedTool::new(McpErrorTool, Arc::new(wrapper));
 
-        let ctx = ToolCallContext::new("mcp_tool");
-        let result = wrapper.transform_args(serde_json::json!({}), &ctx);
-        let _ = rx.recv().await.unwrap();
+        let output = tool.call(serde_json::json!({})).await.unwrap();
+        assert!(output.starts_with("[worker-a] "), "{output}");
 
-        wrapper
-            .on_complete(
-                &ctx,
-                result.extracted.as_ref(),
-                Ok("Tool returned an error: 401 Unauthorized"),
-                50,
-            )
-            .await;
-
+        let _started = rx.recv().await.unwrap();
         match rx.recv().await.unwrap() {
             ToolEvent::CallCompleted { result, .. } => {
-                assert!(
-                    matches!(&result, ToolOutcome::Failure { error } if error == "Tool returned an error: 401 Unauthorized"),
-                    "{result:?}"
-                );
+                assert!(matches!(&result, ToolOutcome::Failure { .. }), "{result:?}")
             }
             _ => panic!("Expected CallCompleted event"),
         }
