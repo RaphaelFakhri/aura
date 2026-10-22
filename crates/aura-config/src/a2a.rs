@@ -30,9 +30,7 @@ pub const VERSION_HEADER: &str = "a2a-version";
 pub const JSONRPC_PATH: &str = "/a2a/v1/rpc";
 
 /// Header names an operator may not set through `headers` or map through
-/// `headers_from_request`: the client owns the protocol and framing headers,
-/// and the agent-selection header is the `model` setting's job, so a mapping
-/// cannot hand that choice to whoever sends the inbound request.
+/// `headers_from_request`.
 pub const RESERVED_HEADERS: [&str; 5] = [
     MODEL_HEADER,
     VERSION_HEADER,
@@ -88,6 +86,9 @@ pub fn parse_header(
     Ok((header_name, header_value))
 }
 
+/// The client owns the protocol and framing headers, and the agent-selection
+/// header is the `model` setting's job: a mapping must not hand that choice
+/// to whoever sends the inbound request.
 fn is_reserved_header(name: &str) -> bool {
     let name = name.trim().to_ascii_lowercase();
     RESERVED_HEADERS.contains(&name.as_str())

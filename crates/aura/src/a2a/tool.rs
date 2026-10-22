@@ -31,7 +31,13 @@ const MAX_TRANSIENT_POLL_FAILURES: u32 = 2;
 /// Most agents one `ask_agent` call may fan out to in parallel.
 const MAX_BATCH_CALLS: usize = 8;
 
-/// One configured remote plus the polling budget for calls to it.
+/// Artifact id prefixes under which the AURA receiver records a run's
+/// progress rather than its answer.
+const PROGRESS_ARTIFACT_PREFIXES: [&str; 3] = ["tool_call_", "reasoning_", "scratchpad_"];
+
+/// One configured remote plus the polling budget for calls to it. Cloning
+/// shares the HTTP client and its connection pool.
+#[derive(Clone)]
 pub struct RemoteAgent {
     pub name: String,
     pub description: Option<String>,
@@ -83,13 +89,22 @@ impl RemoteAgent {
         ))
     }
 
+    /// Every `[a2a.remote.<name>]` entry, each with its own HTTP client.
+    pub fn all_from_config(a2a: &A2aConfig) -> Result<Vec<Self>, A2aClientError> {
+        a2a.remote
+            .iter()
+            .map(|(name, remote)| Self::from_config(name, a2a, remote))
+            .collect()
+    }
+
     pub fn endpoint(&self) -> &str {
         self.client.endpoint()
     }
 
     /// Send the prompt, poll until the remote task settles, and render the
-    /// outcome. Gives up at `self.timeout` or when `cancel` fires, in both
-    /// cases asking the remote to cancel the task it was left with.
+    /// outcome with its text cut at `max_response_bytes`. Gives up at
+    /// `self.timeout` or when `cancel` fires, in both cases asking the
+    /// remote to cancel the task it was left with.
     ///
     /// The send runs as its own task so that giving up while it is still in
     /// flight does not lose the task id the remote is about to return: the
@@ -100,6 +115,7 @@ impl RemoteAgent {
         &self,
         call: &AskAgentCall,
         cancel: RequestCancelToken,
+        max_response_bytes: usize,
     ) -> Result<String, ToolError> {
         let open = Arc::new(OpenTask::new(&self.name, self.client.clone()));
         // Set once `run` has taken the send task's output; polling the
@@ -109,11 +125,17 @@ impl RemoteAgent {
             let client = self.client.clone();
             let prompt = call.prompt.clone();
             let context_id = call.context_id.clone();
+            let task_id = call.task_id.clone();
             let model = self.model.clone();
             let open = Arc::clone(&open);
             async move {
                 let reply = client
-                    .send_message(&prompt, context_id.as_deref(), model.as_deref())
+                    .send_message(
+                        &prompt,
+                        context_id.as_deref(),
+                        task_id.as_deref(),
+                        model.as_deref(),
+                    )
                     .await;
                 if let Ok(SendMessageResponse::Task(task)) = &reply {
                     open.record(&task.id);
@@ -138,7 +160,7 @@ impl RemoteAgent {
                     return Ok(AskAgentOutcome::from_message(
                         &self.name,
                         &message,
-                        self.max_response_bytes,
+                        max_response_bytes,
                     ));
                 }
                 SendMessageResponse::Task(task) => task,
@@ -178,7 +200,7 @@ impl RemoteAgent {
             Ok(AskAgentOutcome::from_task(
                 &self.name,
                 &task,
-                self.max_response_bytes,
+                max_response_bytes,
             ))
         };
 
@@ -207,7 +229,16 @@ impl RemoteAgent {
                 let _ = tokio::time::timeout(ABANDON_TIMEOUT, &mut send).await;
             }
             if let Some(task_id) = open.take() {
-                abandon(&self.name, &self.client, &task_id).await;
+                // Detached, so a caller that drops this future mid-cancel
+                // (the orchestration loop breaking on the same token that
+                // stopped us) does not drop the CancelTask with it.
+                let _ = spawn_abandon(
+                    &tokio::runtime::Handle::current(),
+                    self.name.clone(),
+                    self.client.clone(),
+                    task_id,
+                )
+                .await;
             }
         } else {
             // Settling suppresses the guard's Drop-cancel. That is only safe
@@ -225,6 +256,17 @@ impl RemoteAgent {
     fn remote_error(&self, error: A2aClientError) -> ToolError {
         call_error(format!("remote agent {:?}: {error}", self.name))
     }
+}
+
+/// [`abandon`] on a task of its own, so it completes whether or not the
+/// caller stays around to await the handle.
+fn spawn_abandon(
+    runtime: &tokio::runtime::Handle,
+    remote: String,
+    client: A2aClient,
+    task_id: String,
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn(async move { abandon(&remote, &client, &task_id).await })
 }
 
 /// Best-effort remote cancel for a task this side has stopped waiting on.
@@ -319,9 +361,7 @@ impl Drop for OpenTask {
             task_id,
             "call dropped with an open remote task; cancelling it in the background"
         );
-        let remote = self.remote.clone();
-        let client = self.client.clone();
-        runtime.spawn(async move { abandon(&remote, &client, &task_id).await });
+        spawn_abandon(&runtime, self.remote.clone(), self.client.clone(), task_id);
     }
 }
 
@@ -340,8 +380,8 @@ fn is_settled(state: &TaskState) -> bool {
 }
 
 /// Arguments the model passes to `ask_agent`: the single-agent form
-/// (`agent` + `prompt`, optional `context_id`) or a `calls` batch of
-/// sub-requests.
+/// (`agent` + `prompt`, optional `context_id` and `task_id`) or a `calls`
+/// batch of sub-requests.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AskAgentArgs {
@@ -349,6 +389,8 @@ struct AskAgentArgs {
     prompt: Option<String>,
     #[serde(default)]
     context_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
     #[serde(default)]
     calls: Option<Vec<AskAgentCall>>,
 }
@@ -360,7 +402,10 @@ impl AskAgentArgs {
     fn into_calls(self) -> Result<Vec<AskAgentCall>, ToolError> {
         let invalid =
             |msg: &str| call_error(format!("invalid {ASK_AGENT_TOOL_NAME} arguments: {msg}"));
-        let single = self.agent.is_some() || self.prompt.is_some() || self.context_id.is_some();
+        let single = self.agent.is_some()
+            || self.prompt.is_some()
+            || self.context_id.is_some()
+            || self.task_id.is_some();
         match (self.calls, single) {
             (Some(calls), false) if calls.is_empty() => Err(invalid("`calls` must not be empty")),
             (Some(calls), false) if calls.len() > MAX_BATCH_CALLS => Err(invalid(&format!(
@@ -369,7 +414,7 @@ impl AskAgentArgs {
             ))),
             (Some(calls), false) => Ok(calls),
             (Some(_), true) => Err(invalid(
-                "`calls` cannot be combined with `agent`, `prompt`, or `context_id`",
+                "`calls` cannot be combined with `agent`, `prompt`, `context_id`, or `task_id`",
             )),
             (None, true) => {
                 let (agent, prompt) = match (self.agent, self.prompt) {
@@ -380,6 +425,7 @@ impl AskAgentArgs {
                     agent,
                     prompt,
                     context_id: self.context_id,
+                    task_id: self.task_id,
                 }])
             }
             (None, false) => Err(invalid("pass `agent` and `prompt`, or `calls`")),
@@ -395,13 +441,15 @@ struct AskAgentCall {
     prompt: String,
     #[serde(default)]
     context_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
 }
 
 /// What `ask_agent` hands back to the model.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct AskAgentOutcome {
     pub agent: String,
-    pub state: String,
+    pub state: TaskState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -410,19 +458,35 @@ pub struct AskAgentOutcome {
 }
 
 impl AskAgentOutcome {
-    /// A finished task. The AURA server puts the full reply in its `final`
-    /// artifact and the streamed chunks in `response`; other servers get
-    /// every text part joined, and lastly the status message. The text is
-    /// cut at `max_response_bytes` with a notice, since nothing intercepts
-    /// a remote answer the way the scratchpad intercepts MCP output.
+    /// A finished task. A task that failed, was rejected, or was cancelled
+    /// reports the status message, where the AURA server puts the error,
+    /// ahead of any artifact, since a run that streamed text before failing
+    /// leaves a partial `response` behind. One waiting on input reports the
+    /// question in its status message. Otherwise the AURA server puts the
+    /// full reply in its `final` artifact and the streamed chunks in
+    /// `response`; other servers get every text part joined, and lastly the
+    /// status message. The text is cut at `max_response_bytes` with a
+    /// notice, since nothing intercepts a remote answer the way the
+    /// scratchpad intercepts MCP output.
     fn from_task(agent: &str, task: &Task, max_response_bytes: usize) -> Self {
         let response = match &task.status.state {
             TaskState::InputRequired | TaskState::AuthRequired => status_text(task),
-            _ => final_text(task),
+            TaskState::Failed | TaskState::Rejected | TaskState::Canceled => {
+                let status = status_text(task);
+                if status.is_empty() {
+                    final_text(task)
+                } else {
+                    status
+                }
+            }
+            TaskState::Unspecified
+            | TaskState::Submitted
+            | TaskState::Working
+            | TaskState::Completed => final_text(task),
         };
         Self {
             agent: agent.to_owned(),
-            state: state_label(&task.status.state).to_owned(),
+            state: task.status.state.clone(),
             task_id: Some(task.id.clone()),
             context_id: Some(task.context_id.clone()),
             response: bounded_response(response, max_response_bytes),
@@ -433,7 +497,7 @@ impl AskAgentOutcome {
     fn from_message(agent: &str, message: &Message, max_response_bytes: usize) -> Self {
         Self {
             agent: agent.to_owned(),
-            state: state_label(&TaskState::Completed).to_owned(),
+            state: TaskState::Completed,
             task_id: message.task_id.clone(),
             context_id: message.context_id.clone(),
             response: bounded_response(parts_text(&message.parts), max_response_bytes),
@@ -447,27 +511,32 @@ impl AskAgentOutcome {
     /// envelope invites the model to relay the envelope rather than the
     /// answer.
     fn render(self) -> Result<String, ToolError> {
-        match self.state.as_str() {
-            "failed" | "rejected" | "canceled" => {
+        let state = state_label(&self.state);
+        match self.state {
+            TaskState::Failed | TaskState::Rejected | TaskState::Canceled => {
                 let detail = if self.response.is_empty() {
                     "no details".to_owned()
                 } else {
                     self.response
                 };
                 Err(call_error(format!(
-                    "remote agent {:?} task {} ended in state {}:\n{detail}",
+                    "remote agent {:?} task {} ended in state {state}:\n{detail}",
                     self.agent,
                     self.task_id.as_deref().unwrap_or("?"),
-                    self.state,
                 )))
             }
-            _ => {
+            TaskState::Unspecified
+            | TaskState::Submitted
+            | TaskState::Working
+            | TaskState::Completed
+            | TaskState::InputRequired
+            | TaskState::AuthRequired => {
                 let body = if self.response.is_empty() {
                     "(the remote agent returned no text)".to_owned()
                 } else {
                     self.response
                 };
-                let mut trailer = format!("remote agent {:?} · {}", self.agent, self.state);
+                let mut trailer = format!("remote agent {:?} · {state}", self.agent);
                 if let Some(task_id) = &self.task_id {
                     trailer.push_str(&format!(" · task {task_id}"));
                 }
@@ -518,9 +587,16 @@ fn final_text(task: &Task) -> String {
             }
         }
     }
+    // Progress artifacts are the run's tool log and chain of thought; handed
+    // over as the answer, the model may relay them to the user verbatim.
     let joined = artifacts
         .iter()
-        .map(|a: &Artifact| parts_text(&a.parts))
+        .filter(|a: &&Artifact| {
+            !PROGRESS_ARTIFACT_PREFIXES
+                .iter()
+                .any(|prefix| a.artifact_id.starts_with(prefix))
+        })
+        .map(|a| parts_text(&a.parts))
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
@@ -596,22 +672,26 @@ impl RemoteAgentTool {
 
     /// Every `[a2a.remote.<name>]` entry as one tool.
     pub fn from_config(a2a: &A2aConfig, run: Arc<BoundRun>) -> Result<Self, A2aClientError> {
-        let mut remotes = Vec::with_capacity(a2a.remote.len());
-        for (name, remote) in &a2a.remote {
-            remotes.push(RemoteAgent::from_config(name, a2a, remote)?);
-        }
-        Ok(Self::new(remotes, run))
+        Ok(Self::new(RemoteAgent::all_from_config(a2a)?, run))
     }
 
-    /// The tool's description and parameter schema for `a2a`, computed from
-    /// the config alone: what a planner needs without building HTTP clients.
-    pub fn planning_definition(a2a: &A2aConfig) -> (String, Value) {
-        let listing: BTreeMap<&str, Option<&str>> = a2a
-            .remote
-            .iter()
-            .map(|(name, r)| (name.as_str(), r.description.as_deref()))
+    /// The tool's parameter schema over `remotes`, for a planner that
+    /// inspects tool parameters without building the tool.
+    pub fn planning_parameters<'a>(remotes: impl IntoIterator<Item = &'a RemoteAgent>) -> Value {
+        let listing: BTreeMap<&str, Option<&str>> = remotes
+            .into_iter()
+            .map(|r| (r.name.as_str(), r.description.as_deref()))
             .collect();
-        (describe(&listing), parameters(&listing))
+        parameters(&listing)
+    }
+
+    /// A one-line description of the tool for a planner's tool inventory,
+    /// naming the remotes it reaches. The model-facing description runs to
+    /// several lines of instructions for the caller, and its `- name` lines
+    /// would read as sibling tools in a planning prompt.
+    pub fn planning_summary<'a>(remote_names: impl IntoIterator<Item = &'a str>) -> String {
+        let names: Vec<&str> = remote_names.into_iter().collect();
+        format!("delegate to remote agents ({})", names.join(", "))
     }
 
     /// Whether a call publishes its events on the run's event stream.
@@ -699,9 +779,10 @@ fn describe(remotes: &BTreeMap<&str, Option<&str>>) -> String {
          followed by a one-line trailer carrying the task state, task id, and context_id; \
          present the answer in your own words and do not quote the trailer. If a call fails, \
          the result says why — summarize the failure for the user in your own words instead \
-         of relaying the raw error. To continue the \
-         exchange — including answering an input_required or auth_required question — call \
-         ask_agent again with the same agent and the trailer's context_id. To put a request \
+         of relaying the raw error. To continue the exchange, call ask_agent again with the \
+         same agent and the trailer's context_id. To answer an input_required or \
+         auth_required question, also pass the trailer's task id as task_id, so the answer \
+         reaches the task that asked instead of opening a new one. To put a request \
          to several agents at once, pass `calls` with one entry per agent instead of \
          `agent` and `prompt`; the agents run in parallel, and the result carries each \
          agent's report under a `## <agent>` heading with its own trailer — write one reply \
@@ -739,6 +820,12 @@ fn parameters(remotes: &BTreeMap<&str, Option<&str>>) -> Value {
                 "description": "Continue an earlier exchange with the same agent: the \
                                 context_id a previous ask_agent result returned."
             },
+            "task_id": {
+                "type": "string",
+                "description": "Answer a question the agent asked (state input_required or \
+                                auth_required): the task id that result returned, alongside \
+                                its context_id."
+            },
             "calls": {
                 "type": "array",
                 "description": "Ask several agents in parallel: one entry per agent. Use \
@@ -760,6 +847,11 @@ fn parameters(remotes: &BTreeMap<&str, Option<&str>>) -> Value {
                         "context_id": {
                             "type": "string",
                             "description": "Continue an earlier exchange with this agent."
+                        },
+                        "task_id": {
+                            "type": "string",
+                            "description": "Answer a question this agent asked: the task id \
+                                            its result returned."
                         }
                     },
                     "required": ["agent", "prompt"],
@@ -812,23 +904,28 @@ impl RigTool for RemoteAgentTool {
             }
             self.announce_start().await;
             // Every sub-call runs its own send/poll/cancel lifecycle; the
-            // batch waits for all of them, so N agents cost one budget, not
-            // N. A batch where every agent failed is a failed call; one with
-            // any answer carries each failure as its own section.
+            // batch waits for all of them, so N agents cost one time budget,
+            // not N. The response budget is one tool result's worth, split
+            // evenly across the members, so a batch never puts more into the
+            // context than a single answer may. A batch where every agent
+            // failed is a failed call; one with any answer carries each
+            // failure as its own section.
             let cancel = self.cancel_token();
             let started = std::time::Instant::now();
+            let members = resolved.len();
             let mut in_flight: futures::stream::FuturesUnordered<_> = resolved
                 .iter()
                 .enumerate()
                 .map(|(idx, (remote, call))| {
                     let cancel = cancel.clone();
+                    let budget = (remote.max_response_bytes / members).max(1);
                     let span = tracing::info_span!(
                         "a2a.ask_agent",
                         a2a.remote = %remote.name,
                         a2a.endpoint = %remote.endpoint(),
                         a2a.task_id = tracing::field::Empty,
                     );
-                    async move { (idx, remote.ask(call, cancel).await) }.instrument(span)
+                    async move { (idx, remote.ask(call, cancel, budget).await) }.instrument(span)
                 })
                 .collect();
             let mut sections: Vec<Option<Result<String, ToolError>>> =
@@ -1741,7 +1838,7 @@ mod tests {
     }
 
     #[test]
-    fn planning_definition_matches_the_built_tool_without_clients() {
+    fn planning_views_match_the_built_tool() {
         let mut remote = HashMap::new();
         remote.insert(
             "dev".to_owned(),
@@ -1759,10 +1856,203 @@ mod tests {
             remote,
             ..A2aConfig::default()
         };
-        let (description, parameters) = RemoteAgentTool::planning_definition(&a2a);
-        let built = RemoteAgentTool::from_config(&a2a, Arc::default()).unwrap();
-        assert_eq!(description, built.description());
-        assert_eq!(&parameters, built.parameters());
-        assert!(description.contains("- dev: dev cluster"));
+        let remotes = RemoteAgent::all_from_config(&a2a).unwrap();
+        let built = RemoteAgentTool::new(remotes.clone(), Arc::default());
+        assert_eq!(
+            &RemoteAgentTool::planning_parameters(&remotes),
+            built.parameters()
+        );
+        assert!(built.description().contains("- dev: dev cluster"));
+        // The planner's one-liner carries the names and none of the
+        // caller-facing instructions.
+        let summary = RemoteAgentTool::planning_summary(remotes.iter().map(|r| r.name.as_str()));
+        assert_eq!(summary, "delegate to remote agents (dev)");
+        assert!(!summary.contains('\n'));
+    }
+
+    /// A server whose task ends in `state` carrying `detail` in its status
+    /// message and the text the run streamed before that in `response`.
+    async fn ending_server_with_partial_response(
+        state: &'static str,
+        detail: &'static str,
+    ) -> LoopbackA2aServer {
+        LoopbackA2aServer::start(move |method, _| match method {
+            "SendMessage" => Ok(json!({ "task": working_task("t9", "c") })),
+            "GetTask" => Ok(json!({
+                "id": "t9", "contextId": "c",
+                "status": { "state": state, "message": {
+                    "messageId": "m", "role": "ROLE_AGENT", "parts": [ { "text": detail } ]
+                }},
+                "artifacts": [
+                    { "artifactId": "response", "name": "Response",
+                      "parts": [ { "text": "Let me start by" } ] }
+                ]
+            })),
+            other => panic!("unexpected method {other}"),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_reports_its_status_message_over_a_partial_response() {
+        for state in [
+            "TASK_STATE_FAILED",
+            "TASK_STATE_REJECTED",
+            "TASK_STATE_CANCELED",
+        ] {
+            let server = ending_server_with_partial_response(state, "LLM quota exceeded").await;
+            let tool = RemoteAgentTool::new(vec![remote("dev", &server, None)], Arc::default());
+            let err = tool
+                .call(json!({ "agent": "dev", "prompt": "hi" }))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.ends_with(":\nLLM quota exceeded"), "{state}: {err}");
+            assert!(!err.contains("Let me start by"), "{state}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_artifacts_are_not_relayed_as_the_answer() {
+        // No `final` or `response` text: the remaining artifacts are joined,
+        // minus the receiver's tool log and chain of thought.
+        let server = LoopbackA2aServer::start(|method, _| match method {
+            "SendMessage" => Ok(json!({ "task": working_task("t", "c") })),
+            "GetTask" => Ok(json!({
+                "id": "t", "contextId": "c",
+                "status": { "state": "TASK_STATE_COMPLETED" },
+                "artifacts": [
+                    { "artifactId": "tool_call_1", "parts": [ { "text": "Tool was called: kubectl" } ] },
+                    { "artifactId": "reasoning_1", "parts": [ { "text": "thinking about it" } ] },
+                    { "artifactId": "scratchpad_dev", "parts": [ { "text": "saved 3 files" } ] },
+                    { "artifactId": "notes", "parts": [ { "text": "the cluster is healthy" } ] }
+                ]
+            })),
+            other => panic!("unexpected method {other}"),
+        })
+        .await;
+        let tool = RemoteAgentTool::new(vec![remote("dev", &server, None)], Arc::default());
+        let out = tool
+            .call(json!({ "agent": "dev", "prompt": "x" }))
+            .await
+            .unwrap();
+        assert!(out.starts_with("the cluster is healthy\n"), "{out}");
+        for leaked in ["Tool was called", "thinking about it", "saved 3 files"] {
+            assert!(!out.contains(leaked), "{out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_splits_the_response_budget_across_its_members() {
+        let long = "x".repeat(100);
+        let server = |text: String| async move {
+            LoopbackA2aServer::start(move |method, _| match method {
+                "SendMessage" => Ok(json!({ "task": working_task("t", "c") })),
+                "GetTask" => Ok(completed_task("t", "c", &text)),
+                other => panic!("unexpected method {other}"),
+            })
+            .await
+        };
+        let (a, b) = (server(long.clone()).await, server(long.clone()).await);
+        let budget = |name: &str, server: &LoopbackA2aServer| {
+            RemoteAgent::new(
+                name,
+                A2aClient::new(&server.url, &HashMap::new(), "aura/test").unwrap(),
+                None,
+                None,
+                Duration::from_millis(20),
+                Duration::from_secs(5),
+                40,
+            )
+        };
+        let tool = RemoteAgentTool::new(vec![budget("a", &a), budget("b", &b)], Arc::default());
+
+        let single = tool
+            .call(json!({ "agent": "a", "prompt": "x" }))
+            .await
+            .unwrap();
+        assert!(single.contains("was 100 bytes, limit 40]"), "{single}");
+
+        // Two members share the one budget: 20 bytes each.
+        let batch = tool
+            .call(json!({ "calls": [
+                { "agent": "a", "prompt": "x" },
+                { "agent": "b", "prompt": "x" }
+            ] }))
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.matches("was 100 bytes, limit 20]").count(),
+            2,
+            "{batch}"
+        );
+        assert!(!batch.contains(&"x".repeat(21)), "{batch}");
+    }
+
+    #[tokio::test]
+    async fn task_id_addresses_the_task_that_asked() {
+        let server = LoopbackA2aServer::start(|method, params| match method {
+            "SendMessage" => {
+                assert_eq!(params["message"]["taskId"], "t-asking");
+                assert_eq!(params["message"]["contextId"], "c");
+                Ok(json!({ "task": completed_task("t-asking", "c", "thanks") }))
+            }
+            other => panic!("unexpected method {other}"),
+        })
+        .await;
+        let tool = RemoteAgentTool::new(vec![remote("dev", &server, None)], Arc::default());
+        let out = tool
+            .call(json!({
+                "agent": "dev", "prompt": "yes, go ahead",
+                "context_id": "c", "task_id": "t-asking"
+            }))
+            .await
+            .unwrap();
+        assert!(out.starts_with("thanks\n"), "{out}");
+
+        // The batch form carries it per entry; a batch cannot carry the
+        // single-form field.
+        let err = tool
+            .call(json!({ "task_id": "t", "calls": [ { "agent": "dev", "prompt": "x" } ] }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_then_dropping_the_call_still_cancels_the_remote_task() {
+        // The orchestration loop selects on the same token the call does, so
+        // the call's future can be dropped while its CancelTask is in flight.
+        let server = LoopbackA2aServer::start(|method, _| match method {
+            "SendMessage" => Ok(json!({ "task": working_task("slow", "c") })),
+            "GetTask" => Ok(working_task("slow", "c")),
+            "CancelTask" => Ok(json!({
+                "id": "slow", "contextId": "c", "status": { "state": "TASK_STATE_CANCELED" }
+            })),
+            other => panic!("unexpected method {other}"),
+        })
+        .await;
+        let (run, _events) = RunContext::channel(crate::config::RunId::mint());
+        let tool = RemoteAgentTool::new(
+            vec![remote("dev", &server, None)],
+            Arc::new(BoundRun::holding(Arc::clone(&run))),
+        );
+        let call =
+            tokio::spawn(async move { tool.call(json!({ "agent": "dev", "prompt": "x" })).await });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        run.cancel_token().cancel();
+        tokio::task::yield_now().await;
+        call.abort();
+        let _ = call.await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while server.methods().last().map(String::as_str) != Some("CancelTask") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no CancelTask after cancel then drop: {:?}",
+                server.methods()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

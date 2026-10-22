@@ -24,9 +24,7 @@ use serde_json::Value;
 /// Bytes of a non-2xx body kept in the error message.
 const MAX_ERROR_BODY_BYTES: usize = 512;
 
-/// Largest response body read from a remote. A task carrying every artifact
-/// of a long run fits comfortably; anything larger is a broken gateway or a
-/// hostile peer, and is refused rather than buffered.
+/// Largest response body read from a remote.
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Connect timeout for the underlying HTTP client.
@@ -129,16 +127,20 @@ impl A2aClient {
     }
 
     /// Send one user text message. `context_id` continues an earlier
-    /// exchange; `model` selects an agent on the remote. The remote answers
-    /// with either a task to poll or a finished message.
+    /// exchange; `task_id` addresses a task of that exchange that is waiting
+    /// on input, since a message without one opens a new task; `model`
+    /// selects an agent on the remote. The remote answers with either a
+    /// task to poll or a finished message.
     pub async fn send_message(
         &self,
         text: &str,
         context_id: Option<&str>,
+        task_id: Option<&str>,
         model: Option<&str>,
     ) -> Result<SendMessageResponse, A2aClientError> {
         let mut message = Message::new(Role::User, vec![Part::text(text)]);
         message.context_id = context_id.map(str::to_owned);
+        message.task_id = task_id.map(str::to_owned);
         let request = SendMessageRequest {
             message,
             configuration: Some(SendMessageConfiguration {
@@ -378,7 +380,9 @@ mod wire {
 }
 
 /// Read at most `limit` bytes of `response`, refusing a declared or streamed
-/// body beyond that instead of buffering it.
+/// body beyond that instead of buffering it. A task carrying every artifact
+/// of a long run fits well under [`MAX_BODY_BYTES`]; anything larger is a
+/// broken gateway or a hostile peer.
 async fn read_body_bounded(
     response: reqwest::Response,
     endpoint: &str,
@@ -456,7 +460,7 @@ mod tests {
         let client = A2aClient::new(&server.url, &headers, "aura/test").unwrap();
 
         let reply = client
-            .send_message("hello", Some("ctx-1"), Some("verifier"))
+            .send_message("hello", Some("ctx-1"), Some("t0"), Some("verifier"))
             .await
             .unwrap();
         let SendMessageResponse::Task(task) = reply else {
@@ -474,6 +478,7 @@ mod tests {
         assert_eq!(body["method"], "SendMessage");
         assert_eq!(body["params"]["message"]["role"], "ROLE_USER");
         assert_eq!(body["params"]["message"]["contextId"], "ctx-1");
+        assert_eq!(body["params"]["message"]["taskId"], "t0");
         assert_eq!(body["params"]["message"]["parts"][0]["text"], "hello");
         assert_eq!(body["params"]["configuration"]["returnImmediately"], true);
     }
@@ -493,7 +498,7 @@ mod tests {
         ]);
         let client = A2aClient::new(&server.url, &headers, "aura/test").unwrap();
         client
-            .send_message("hi", None, Some("configured"))
+            .send_message("hi", None, None, Some("configured"))
             .await
             .unwrap();
 
@@ -564,7 +569,7 @@ mod tests {
         })
         .await;
         let client = A2aClient::new(&server.url, &HashMap::new(), "aura/test").unwrap();
-        let reply = client.send_message("hi", None, None).await.unwrap();
+        let reply = client.send_message("hi", None, None, None).await.unwrap();
         let SendMessageResponse::Task(task) = reply else {
             panic!("expected a task");
         };

@@ -1131,9 +1131,7 @@ impl AuraStreamEvent {
         }
     }
 
-    /// Create a RemoteAgentAnswer event, emitted as each batch member's
-    /// answer lands — instead of waiting for the whole batch — so a client
-    /// can show one agent's report while the rest are still running.
+    /// Create a RemoteAgentAnswer event.
     pub fn remote_agent_answer(
         remote: impl Into<String>,
         success: bool,
