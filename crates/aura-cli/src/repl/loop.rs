@@ -2909,8 +2909,10 @@ impl StreamHandler for ReplStreamHandler {
                     (AuraStyle::Error, "failed")
                 };
                 let line = format!("⏺ {remote} {label} in {:.1}s", elapsed_ms as f64 / 1000.0);
+                crate::ui::prompt::increment_orch_scrollback_wrapped(&line);
                 println!("{}", line.themed(style));
-                render_markdown(text);
+                let rows = render_markdown(text);
+                crate::ui::prompt::increment_orch_scrollback_by(rows);
                 println!();
                 crate::ui::prompt::increment_orch_scrollback();
             }
