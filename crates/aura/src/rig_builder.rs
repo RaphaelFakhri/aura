@@ -281,6 +281,25 @@ pub(crate) fn apply_request_header_mappings(
     resolved
 }
 
+/// Overlay `headers_from_request` mappings resolved against `req_headers`
+/// on the static `headers`, which serve as fallback when the mapped request
+/// header is absent. Static keys are lowercased first, since
+/// [`apply_request_header_mappings`] inserts under lowercased keys, so a
+/// mapped override replaces the static value instead of coexisting under a
+/// case-distinct key. Returns the number of mappings resolved.
+pub(crate) fn overlay_request_headers(
+    headers: &mut HashMap<String, String>,
+    headers_from_request: &HashMap<String, String>,
+    req_headers: &HashMap<String, String>,
+) -> usize {
+    let normalized: HashMap<String, String> = headers
+        .drain()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect();
+    *headers = normalized;
+    apply_request_header_mappings(headers, headers_from_request, req_headers)
+}
+
 /// Resolve remote-agent headers by applying `headers_from_request` mappings
 /// from the incoming request, the same way [`resolve_mcp_headers`] does for
 /// MCP servers.
@@ -295,12 +314,7 @@ fn resolve_a2a_headers(
 }
 
 /// Resolve `headers_from_request` mappings on an [`A2aConfig`] directly.
-///
-/// Static TOML `headers` are already loaded in each remote's header map and
-/// serve as fallback when the mapped request header is absent. Static keys
-/// are lowercased first so a mapped override replaces the static value
-/// instead of coexisting under a case-distinct key.
-pub fn resolve_a2a_headers_in(
+fn resolve_a2a_headers_in(
     a2a_config: &mut A2aConfig,
     req_headers: Option<&HashMap<String, String>>,
 ) {
@@ -308,14 +322,7 @@ pub fn resolve_a2a_headers_in(
     let req_headers = req_headers.unwrap_or(&empty);
 
     for (remote_name, remote) in a2a_config.remote.iter_mut() {
-        let normalized: HashMap<String, String> = remote
-            .headers
-            .iter()
-            .map(|(k, v)| (k.to_lowercase(), v.clone()))
-            .collect();
-        remote.headers = normalized;
-
-        let resolved = apply_request_header_mappings(
+        let resolved = overlay_request_headers(
             &mut remote.headers,
             &remote.headers_from_request,
             req_headers,
@@ -377,22 +384,7 @@ pub fn resolve_mcp_headers_in(
             }
         };
 
-        // Lowercase static header keys so mapped overrides (inserted under
-        // lowercased keys by `apply_request_header_mappings`) replace the
-        // static fallback rather than coexisting as a case-distinct entry.
-        let normalized: HashMap<String, String> = server_headers
-            .iter()
-            .map(|(k, v)| (k.to_lowercase(), v.clone()))
-            .collect();
-        *server_headers = normalized;
-
-        // Resolve headers_from_request mappings using the incoming request
-        // headers. Static TOML headers are already in server_headers; this
-        // only overrides when the mapped request header is found. Count
-        // resolved mappings (inserts AND overrides), not the length delta —
-        // an override leaves the map size unchanged but is still a resolution.
-        let resolved =
-            apply_request_header_mappings(server_headers, headers_from_request, req_headers);
+        let resolved = overlay_request_headers(server_headers, headers_from_request, req_headers);
         if resolved > 0 {
             tracing::info!(
                 "Server '{}': resolved {} header(s) from request",
