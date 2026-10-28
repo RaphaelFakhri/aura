@@ -2392,6 +2392,14 @@ model = "gpt-4"
                 "[governance.catalog]\nurl = \"https://catalog.example.com/sync\"\nheaders_from_request = { Authorization = \"authorization\", AUTHORIZATION = \"x-token\" }\n",
                 "governance.catalog.headers_from_request",
             ),
+            (
+                "[hitl]\nrequire_approval = []\n\n[hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\nheaders_from_request = { Authorization = \"authorization\", authorization = \"x-token\" }\n",
+                "hitl.route.headers_from_request",
+            ),
+            (
+                "[governance.catalog]\nurl = \"https://catalog.example.com/sync\"\nheaders = { X-Tenant = \"a\", x-tenant = \"b\" }\n",
+                "governance.catalog.headers",
+            ),
         ] {
             let toml = format!("{HEADER_CASE_BASE}\n{table}");
             let err = load_config_from_str(&toml)
